@@ -2,9 +2,31 @@
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
+import https from 'https';
 
 const app = express();
 app.use(cors());
+
+// Create an agent that ignores SSL certificate errors
+// IMPORTANT: Only use for specific trusted domains
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false
+});
+
+// List of domains that need SSL certificate bypass
+const INSECURE_DOMAINS = [
+  'nmrshiftdb.nmr.uni-koeln.de'
+];
+
+// Helper to determine if a URL should use insecure agent
+function shouldUseInsecureAgent(url) {
+  try {
+    const urlObj = new URL(url);
+    return INSECURE_DOMAINS.some(domain => urlObj.hostname.includes(domain));
+  } catch (e) {
+    return false;
+  }
+}
 
 // Main proxy endpoint
 app.get('/api/proxy', async (req, res) => {
@@ -16,7 +38,14 @@ app.get('/api/proxy', async (req, res) => {
   console.log(`Proxying request to: ${url}`);
   
   try {
-    const response = await fetch(url);
+    // Select appropriate agent based on the URL
+    const options = shouldUseInsecureAgent(url) 
+      ? { agent: httpsAgent }
+      : {};
+    
+    console.log(`Using ${options.agent ? 'insecure' : 'secure'} connection for: ${url}`);
+    
+    const response = await fetch(url, options);
     
     // Get content type to properly handle different response formats
     const contentType = response.headers.get('content-type') || '';
@@ -27,7 +56,7 @@ app.get('/api/proxy', async (req, res) => {
     } else {
       // For text, JCAMP-DX, and other formats
       const text = await response.text();
-      res.set('Content-Type', contentType);
+      res.set('Content-Type', contentType || 'text/plain');
       res.send(text);
     }
   } catch (err) {
@@ -40,25 +69,38 @@ app.get('/api/proxy', async (req, res) => {
 app.get('/api/nmr', async (req, res) => {
   const smiles = req.query.smiles;
   const nucleus = req.query.nucleus || '13C';
+  const format = req.query.format || 'jcamp'; // Allow different output formats
   
   if (!smiles) {
     return res.status(400).send('Missing SMILES parameter');
   }
   
-  const url = `https://nmrshiftdb.nmr.uni-koeln.de/NmrshiftdbServlet/nmrshiftdbaction/searchorpredict/smiles/${encodeURIComponent(smiles)}/spectrumtype/${nucleus}/format/jcamp`;
+  const url = `https://nmrshiftdb.nmr.uni-koeln.de/NmrshiftdbServlet/nmrshiftdbaction/searchorpredict/smiles/${encodeURIComponent(smiles)}/spectrumtype/${nucleus}/format/${format}`;
   
-  console.log(`Fetching NMR data for SMILES: ${smiles}, Nucleus: ${nucleus}`);
+  console.log(`Fetching NMR data for SMILES: ${smiles}, Nucleus: ${nucleus}, Format: ${format}`);
   
   try {
-    const response = await fetch(url);
+    // Always use the insecure agent for NMRShiftDB
+    const response = await fetch(url, { agent: httpsAgent });
     const text = await response.text();
     
-    // Check if we received valid JCAMP data
-    if (text.includes('##TITLE=')) {
-      res.set('Content-Type', 'text/plain');
+    // Set appropriate content type based on format
+    if (format === 'jcamp') {
+      if (text.includes('##TITLE=')) {
+        res.set('Content-Type', 'text/plain');
+        res.send(text);
+      } else {
+        res.status(404).send('No NMR data found for the given SMILES');
+      }
+    } else if (format === 'json') {
+      res.set('Content-Type', 'application/json');
+      res.send(text); // The API actually returns XML even when requesting JSON
+    } else if (format === 'cml') {
+      res.set('Content-Type', 'application/xml');
       res.send(text);
     } else {
-      res.status(404).send('No NMR data found for the given SMILES');
+      res.set('Content-Type', 'text/plain');
+      res.send(text);
     }
   } catch (err) {
     console.error('NMR data fetch error:', err);
@@ -98,6 +140,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Proxy running on http://localhost:${PORT}`);
   console.log(`📡 Main proxy endpoint: http://localhost:${PORT}/api/proxy?url=...`);
-  console.log(`📡 NMR endpoint: http://localhost:${PORT}/api/nmr?smiles=...&nucleus=...`);
+  console.log(`📡 NMR endpoint: http://localhost:${PORT}/api/nmr?smiles=...&nucleus=...&format=...`);
   console.log(`📡 PubChem endpoint: http://localhost:${PORT}/api/pubchem?name=...`);
 }); 
